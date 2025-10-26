@@ -1,7 +1,7 @@
 import aiohttp
 import asyncio
 import base64
-from config import BUZZHEAVIER_API_KEY, BUZZHEAVIER_UPLOAD_BASE, MESSAGES
+from config import BUZZHEAVIER_API_KEY, BUZZHEAVIER_UPLOAD_BASE
 
 class BuzzheavierUploader:
     def __init__(self, bot):
@@ -15,6 +15,10 @@ class BuzzheavierUploader:
     
     def format_file_size(self, size_bytes):
         """Format file size in human readable format"""
+        if not size_bytes:
+            return "0 B"
+        
+        size_bytes = int(size_bytes)
         if size_bytes == 0:
             return "0 B"
         
@@ -37,7 +41,7 @@ class BuzzheavierUploader:
             file_content = await file.download_as_bytearray()
             file_size = len(file_content)
             
-            # Prepare upload URL based on available parameters
+            # Prepare upload URL
             upload_url = f"{BUZZHEAVIER_UPLOAD_BASE}/{file_name}"
             
             # Prepare headers
@@ -60,7 +64,8 @@ class BuzzheavierUploader:
                     
                     # Try to parse as JSON, otherwise use as direct URL
                     try:
-                        result = await response.json()
+                        import json
+                        result = json.loads(response_text)
                         download_url = result.get('url', response_text)
                     except:
                         download_url = response_text
@@ -114,7 +119,8 @@ class BuzzheavierUploader:
                 if response.status in [200, 201]:
                     response_text = await response.text()
                     try:
-                        result = await response.json()
+                        import json
+                        result = json.loads(response_text)
                         download_url = result.get('url', response_text)
                     except:
                         download_url = response_text
