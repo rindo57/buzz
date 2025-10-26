@@ -209,5 +209,4 @@ async def main():
     await bot.run()
 
 if __name__ == '__main__':
-    # Use asyncio.run() only once at the top level
     asyncio.run(main())
