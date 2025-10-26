@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import signal
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime
@@ -16,19 +17,16 @@ logger = logging.getLogger(__name__)
 
 class BuzzheavierBot:
     def __init__(self):
-        self.application = Application.builder().token(BOT_TOKEN).build()
+        self.application = None
         self.queue_manager = None
         
-        # Set up handlers
-        self.setup_handlers()
-    
-    def setup_handlers(self):
+    def setup_handlers(self, application):
         """Set up Telegram bot handlers"""
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("queue", self.queue_command))
-        self.application.add_handler(CommandHandler("status", self.status_command))
-        self.application.add_handler(CommandHandler("mystats", self.stats_command))
-        self.application.add_handler(MessageHandler(filters.ALL, self.handle_message))
+        application.add_handler(CommandHandler("start", self.start_command))
+        application.add_handler(CommandHandler("queue", self.queue_command))
+        application.add_handler(CommandHandler("status", self.status_command))
+        application.add_handler(CommandHandler("mystats", self.stats_command))
+        application.add_handler(MessageHandler(filters.ALL, self.handle_message))
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -173,6 +171,12 @@ class BuzzheavierBot:
     async def initialize(self):
         """Initialize the bot and queue manager"""
         logger.info("Initializing Buzzheavier Bot...")
+        
+        # Create application
+        self.application = Application.builder().token(BOT_TOKEN).build()
+        self.setup_handlers(self.application)
+        
+        # Initialize queue manager
         self.queue_manager = GlobalQueueManager(self.application.bot)
         
         # Start queue processing
@@ -200,13 +204,32 @@ class BuzzheavierBot:
         # Initialize the bot
         await self.initialize()
         
-        # Start the bot
-        await self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Start the bot with proper shutdown handling
+        await self.application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False  # Important: don't close the loop
+        )
 
-async def main():
-    """Main function"""
+def main():
+    """Main function with proper event loop handling"""
     bot = BuzzheavierBot()
-    await bot.run()
+    
+    # Create a new event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        # Run the bot
+        loop.run_until_complete(bot.run())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot error: {e}")
+    finally:
+        # Cleanup
+        if bot.application:
+            loop.run_until_complete(bot.application.shutdown())
+        loop.close()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
