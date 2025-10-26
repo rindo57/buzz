@@ -3,6 +3,9 @@ import time
 from database import MongoDBManager
 from uploader import BuzzheavierUploader
 
+# Import MESSAGES directly from config to avoid circular imports
+from config import MESSAGES
+
 class GlobalQueueManager:
     def __init__(self, bot):
         self.db = MongoDBManager()
@@ -10,6 +13,10 @@ class GlobalQueueManager:
         self.bot = bot
         self.is_processing = False
         self.active_tasks = set()
+    
+    async def initialize(self):
+        """Initialize the database indexes"""
+        await self.db.ensure_indexes()
     
     async def add_to_queue(self, file_data):
         """Add file to global queue"""
@@ -20,13 +27,16 @@ class GlobalQueueManager:
         if self.is_processing:
             return
         
+        # Initialize database first
+        await self.initialize()
+        
         self.is_processing = True
         print("🚀 Starting queue processing...")
         
         try:
             while True:
                 # Check if we can process more concurrent uploads
-                if len(self.active_tasks) >= 3:  # MAX_CONCURRENT_UPLOADS
+                if len(self.active_tasks) >= 3:
                     await asyncio.sleep(1)
                     continue
                 
