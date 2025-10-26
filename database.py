@@ -1,130 +1,210 @@
+import motor.motor_asyncio
 import asyncio
-import time
-from database import MongoDBManager
-from uploader import BuzzheavierUploader
+from bson import ObjectId
+from datetime import datetime, timedelta
+from config import MONGODB_URI, MONGODB_DB_NAME, MONGODB_QUEUE_COLLECTION, MONGODB_USERS_COLLECTION, MONGODB_STATS_COLLECTION
 
-class GlobalQueueManager:
-    def __init__(self, bot):
-        self.db = MongoDBManager()
-        self.uploader = BuzzheavierUploader(bot)
-        self.bot = bot
-        self.is_processing = False
-        self.active_tasks = set()
+class MongoDBManager:
+    def __init__(self):
+        self.client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
+        self.db = self.client[MONGODB_DB_NAME]
+        self.queue = self.db[MONGODB_QUEUE_COLLECTION]
+        self.users = self.db[MONGODB_USERS_COLLECTION]
+        self.stats = self.db[MONGODB_STATS_COLLECTION]
+        self._indexes_created = False
     
-    async def initialize(self):
-        """Initialize the database indexes"""
-        await self.db.ensure_indexes()
+    async def ensure_indexes(self):
+        """Create necessary indexes for performance"""
+        if not self._indexes_created:
+            try:
+                await self.queue.create_index("status")
+                await self.queue.create_index("chat_id")
+                await self.queue.create_index("created_at")
+                await self.queue.create_index([("status", 1), ("priority", -1), ("created_at", 1)])
+                await self.users.create_index("chat_id", unique=True)
+                await self.stats.create_index("chat_id")
+                self._indexes_created = True
+                print("✅ MongoDB indexes created successfully")
+            except Exception as e:
+                print(f"❌ Error creating MongoDB indexes: {e}")
     
     async def add_to_queue(self, file_data):
-        """Add file to global queue"""
-        return await self.db.add_to_queue(file_data)
+        """Add file to upload queue"""
+        await self.ensure_indexes()
+        
+        queue_item = {
+            'file_id': file_data['file_id'],
+            'file_name': file_data['file_name'],
+            'file_size': file_data['file_size'],
+            'file_type': file_data.get('file_type', 'document'),
+            'chat_id': file_data['chat_id'],
+            'message_id': file_data['message_id'],
+            'status': 'queued',
+            'priority': 0,
+            'created_at': datetime.utcnow(),
+            'updated_at': datetime.utcnow(),
+            'attempts': 0,
+            'max_attempts': 3
+        }
+        
+        result = await self.queue.insert_one(queue_item)
+        
+        # Get position in queue
+        position = await self.queue.count_documents({
+            'status': 'queued',
+            'created_at': {'$lt': queue_item['created_at']}
+        })
+        
+        return position + 1
     
-    async def process_queue(self):
-        """Process the upload queue continuously"""
-        if self.is_processing:
+    async def get_next_upload(self):
+        """Get next file for processing"""
+        item = await self.queue.find_one_and_update(
+            {
+                'status': 'queued',
+                'attempts': {'$lt': '$max_attempts'}
+            },
+            {
+                '$set': {
+                    'status': 'processing',
+                    'updated_at': datetime.utcnow()
+                },
+                '$inc': {'attempts': 1}
+            },
+            sort=[('priority', -1), ('created_at', 1)]
+        )
+        return item
+    
+    async def mark_completed(self, file_id, download_url=None, error=None):
+        """Mark upload as completed or failed"""
+        update_data = {
+            'updated_at': datetime.utcnow()
+        }
+        
+        if download_url and not error:
+            update_data['status'] = 'completed'
+            update_data['download_url'] = download_url
+            update_data['completed_at'] = datetime.utcnow()
+        else:
+            update_data['status'] = 'failed'
+            update_data['error'] = str(error)
+        
+        await self.queue.update_one(
+            {'file_id': file_id},
+            {'$set': update_data}
+        )
+        
+        # Update user statistics
+        if download_url and not error:
+            await self.update_user_stats(file_id, True)
+        else:
+            await self.update_user_stats(file_id, False)
+    
+    async def update_user_stats(self, file_id, success=True):
+        """Update user upload statistics"""
+        file_item = await self.queue.find_one({'file_id': file_id})
+        if not file_item:
             return
         
-        # Initialize database first
-        await self.initialize()
+        chat_id = file_item['chat_id']
+        file_size = file_item.get('file_size', 0)
         
-        self.is_processing = True
-        print("🚀 Starting queue processing...")
+        update_fields = {
+            'last_upload_at': datetime.utcnow()
+        }
         
-        try:
-            while True:
-                # Check if we can process more concurrent uploads
-                if len(self.active_tasks) >= 3:  # MAX_CONCURRENT_UPLOADS
-                    await asyncio.sleep(1)
-                    continue
-                
-                # Get next item from queue
-                queue_item = await self.db.get_next_upload()
-                
-                if not queue_item:
-                    # No items in queue, wait and check again
-                    await asyncio.sleep(5)
-                    continue
-                
-                # Start upload task
-                task = asyncio.create_task(
-                    self.process_single_upload(queue_item)
-                )
-                self.active_tasks.add(task)
-                task.add_done_callback(self.active_tasks.discard)
-                
-                # Small delay between starting tasks
-                await asyncio.sleep(0.5)
-                
-        except Exception as e:
-            print(f"Queue processing error: {e}")
-        finally:
-            self.is_processing = False
-            await self.uploader.close()
-            print("Queue processing stopped")
-    
-    async def process_single_upload(self, queue_item):
-        """Process a single upload item"""
-        try:
-            # Send upload started message
-            await self.bot.send_message(
-                chat_id=queue_item['chat_id'],
-                text="🚀 Starting upload...",
-                reply_to_message_id=queue_item['message_id']
-            )
-            
-            # Perform upload
-            result = await self.uploader.upload_file(queue_item)
-            
-            if result['success']:
-                # Mark as completed
-                await self.db.mark_completed(
-                    queue_item['file_id'],
-                    download_url=result['download_url']
-                )
-                
-                # Send success message
-                await self.bot.send_message(
-                    chat_id=queue_item['chat_id'],
-                    text=MESSAGES['upload_success'].format(
-                        result['file_name'],
-                        result['download_url'],
-                        result['file_size']
-                    ),
-                    reply_to_message_id=queue_item['message_id']
-                )
-            else:
-                # Mark as failed
-                await self.db.mark_completed(
-                    queue_item['file_id'],
-                    error=result['error']
-                )
-                
-                # Send error message
-                await self.bot.send_message(
-                    chat_id=queue_item['chat_id'],
-                    text=MESSAGES['upload_failed'].format(result['error']),
-                    reply_to_message_id=queue_item['message_id']
-                )
-                
-        except Exception as e:
-            print(f"Error processing upload {queue_item['file_id']}: {e}")
-            await self.db.mark_completed(
-                queue_item['file_id'],
-                error=str(e)
-            )
+        if success:
+            update_fields['uploads_successful'] = 1
+            update_fields['total_size'] = file_size
+        else:
+            update_fields['uploads_failed'] = 1
+        
+        await self.stats.update_one(
+            {'chat_id': chat_id},
+            {
+                '$inc': update_fields,
+                '$setOnInsert': {
+                    'created_at': datetime.utcnow(),
+                    'uploads_total': 0,
+                    'uploads_successful': 0,
+                    'uploads_failed': 0,
+                    'total_size': 0
+                }
+            },
+            upsert=True
+        )
+        
+        # Also increment total uploads count
+        await self.stats.update_one(
+            {'chat_id': chat_id},
+            {'$inc': {'uploads_total': 1}}
+        )
     
     async def get_queue_stats(self):
         """Get queue statistics"""
-        return await self.db.get_queue_stats()
+        total_queued = await self.queue.count_documents({'status': 'queued'})
+        total_processing = await self.queue.count_documents({'status': 'processing'})
+        total_completed = await self.queue.count_documents({'status': 'completed'})
+        total_failed = await self.queue.count_documents({'status': 'failed'})
+        
+        return {
+            'queued': total_queued,
+            'processing': total_processing,
+            'completed': total_completed,
+            'failed': total_failed
+        }
     
     async def get_user_position(self, chat_id):
         """Get user's position in queue"""
-        return await self.db.get_user_position(chat_id)
+        user_item = await self.queue.find_one(
+            {
+                'chat_id': chat_id,
+                'status': 'queued'
+            },
+            sort=[('created_at', 1)]
+        )
+        
+        if not user_item:
+            return None
+        
+        position = await self.queue.count_documents({
+            'status': 'queued',
+            'created_at': {'$lt': user_item['created_at']}
+        })
+        
+        return position + 1
     
     async def get_user_stats(self, chat_id):
         """Get user upload statistics"""
-        return await self.db.get_user_stats(chat_id)
+        stats = await self.stats.find_one({'chat_id': chat_id})
+        if not stats:
+            return {
+                'uploads_total': 0,
+                'uploads_successful': 0,
+                'uploads_failed': 0,
+                'total_size': 0
+            }
+        
+        return {
+            'uploads_total': stats.get('uploads_total', 0),
+            'uploads_successful': stats.get('uploads_successful', 0),
+            'uploads_failed': stats.get('uploads_failed', 0),
+            'total_size': stats.get('total_size', 0)
+        }
     
     async def cleanup_stuck_uploads(self):
-        """Clean up stuck uploads"""
-        await self.db.cleanup_stuck_uploads()
+        """Clean up uploads stuck in processing state for too long"""
+        cutoff_time = datetime.utcnow() - timedelta(hours=1)
+        
+        await self.queue.update_many(
+            {
+                'status': 'processing',
+                'updated_at': {'$lt': cutoff_time}
+            },
+            {
+                '$set': {
+                    'status': 'queued',
+                    'updated_at': datetime.utcnow()
+                }
+            }
+        )
