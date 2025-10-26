@@ -36,6 +36,10 @@ class BuzzheavierBot:
     
     async def queue_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /queue command to show queue status"""
+        if not self.queue_manager:
+            await update.message.reply_text("❌ Queue manager not initialized yet. Please wait...")
+            return
+            
         stats = await self.queue_manager.get_queue_stats()
         user_position = await self.queue_manager.get_user_position(update.effective_chat.id)
         
@@ -54,6 +58,10 @@ class BuzzheavierBot:
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
+        if not self.queue_manager:
+            await update.message.reply_text("❌ Queue manager not initialized yet. Please wait...")
+            return
+            
         stats = await self.queue_manager.get_queue_stats()
         await update.message.reply_text(
             f"🔄 System Status\n"
@@ -66,6 +74,10 @@ class BuzzheavierBot:
     
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /mystats command"""
+        if not self.queue_manager:
+            await update.message.reply_text("❌ Queue manager not initialized yet. Please wait...")
+            return
+            
         user_stats = await self.queue_manager.get_user_stats(update.effective_chat.id)
         
         formatted_size = self.format_file_size(user_stats['total_size'])
@@ -81,6 +93,10 @@ class BuzzheavierBot:
     
     def format_file_size(self, size_bytes):
         """Format file size in human readable format"""
+        if not size_bytes:
+            return "0 B"
+        
+        size_bytes = int(size_bytes)
         if size_bytes == 0:
             return "0 B"
         
@@ -98,6 +114,10 @@ class BuzzheavierBot:
             await update.message.reply_text("Please send a file to upload to buzzheavier.com")
             return
         
+        if not self.queue_manager:
+            await update.message.reply_text("❌ Queue manager not initialized yet. Please wait a moment and try again.")
+            return
+
         try:
             # Get file information
             file_type = 'document'
@@ -152,6 +172,7 @@ class BuzzheavierBot:
     
     async def initialize(self):
         """Initialize the bot and queue manager"""
+        logger.info("Initializing Buzzheavier Bot...")
         self.queue_manager = GlobalQueueManager(self.application.bot)
         
         # Start queue processing
@@ -159,29 +180,34 @@ class BuzzheavierBot:
         
         # Start cleanup task for stuck uploads
         asyncio.create_task(self.periodic_cleanup())
+        logger.info("Buzzheavier Bot initialized successfully!")
     
     async def periodic_cleanup(self):
         """Periodic cleanup of stuck uploads"""
         while True:
             await asyncio.sleep(3600)  # Run every hour
             try:
-                await self.queue_manager.cleanup_stuck_uploads()
-                logger.info("Performed periodic cleanup of stuck uploads")
+                if self.queue_manager:
+                    await self.queue_manager.cleanup_stuck_uploads()
+                    logger.info("Performed periodic cleanup of stuck uploads")
             except Exception as e:
                 logger.error(f"Error during cleanup: {e}")
     
-    def run(self):
-        """Start the bot"""
+    async def run(self):
+        """Start the bot asynchronously"""
         logger.info("Starting Buzzheavier Bot...")
         
-        # Initialize and run
-        asyncio.get_event_loop().run_until_complete(self.initialize())
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Initialize the bot
+        await self.initialize()
+        
+        # Start the bot
+        await self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 async def main():
     """Main function"""
     bot = BuzzheavierBot()
-    bot.run()
+    await bot.run()
 
 if __name__ == '__main__':
+    # Use asyncio.run() only once at the top level
     asyncio.run(main())
